@@ -1,0 +1,137 @@
+# ci-workflows/.github/workflows/odoo-test-reusable.yml
+#
+# SHARED reusable workflow. Lives once in a central repo (e.g. YOUR_ORG/ci-workflows).
+# Projects call it via "uses:" and pass a pinned image + a module prefix.
+#
+# It runs INSIDE the prebuilt CE+EE image, so:
+#   - no Enterprise checkout here (Enterprise is baked in at /mnt/enterprise)
+#   - no SSH key here (that lives only in the image factory)
+#   - git is already present in the image (installed at build time)
+
+name: Odoo module tests (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Full image ref to run tests in. Pin a dated tag for stability."
+        required: true
+        type: string
+      module_prefix:
+        description: "Only test changed modules whose name starts with this. Empty = all changed modules."
+        required: false
+        default: "cap_"
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # bash everywhere: the odoo image's default /bin/sh is dash, which lacks
+    # pipefail / PIPESTATUS. bash is present in the Debian-based odoo image.
+    defaults:
+      run:
+        shell: bash
+
+    container:
+      image: ${{ inputs.image }}
+      # Private GHCR image: authenticate to pull it. Works with GITHUB_TOKEN when
+      # the package is "internal" (or the repo is granted access to the package).
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout (fetch-depth 0 = full history, required for the diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed modules
+        id: changed
+        run: |
+          set -e
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          PREFIX="${{ inputs.module_prefix }}"
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git fetch --no-tags --prune origin "$BASE" "$HEAD"
+          FILES=$(git diff --name-only "$BASE" "$HEAD")
+
+          # Top-level folder kept if its name matches the prefix (empty = any)
+          # AND it contains a __manifest__.py (i.e. a real Odoo module).
+          MODULES=$(echo "$FILES" \
+            | cut -d/ -f1 | sort -u \
+            | while read -r d; do
+                [ -n "$d" ] || continue
+                case "$d" in
+                  ${PREFIX}*) [ -f "$d/__manifest__.py" ] && echo "$d" ;;
+                esac
+              done | paste -sd, -)
+
+          TAGS=$(echo "$MODULES" | tr ',' '\n' | sed '/^$/d; s#^#/#' | paste -sd, -)
+
+          echo "modules=$MODULES" >> "$GITHUB_OUTPUT"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Modules to test: ${MODULES:-none}"
+
+      - name: Build the addons_path
+        if: steps.changed.outputs.modules != ''
+        id: addons
+        run: |
+          ADDONS="/usr/lib/python3/dist-packages/odoo/addons,$GITHUB_WORKSPACE"
+          # Enterprise is baked into the image; include it first if present
+          # (so this also works transparently with a CE-only image).
+          [ -d /mnt/enterprise ] && ADDONS="/mnt/enterprise,$ADDONS"
+          if [ -d "$GITHUB_WORKSPACE/extra-addons" ]; then
+            for d in "$GITHUB_WORKSPACE"/extra-addons/*/; do
+              ADDONS="$ADDONS,${d%/}"
+            done
+          fi
+          echo "path=$ADDONS" >> "$GITHUB_OUTPUT"
+
+      - name: Install + test changed modules
+        if: steps.changed.outputs.modules != ''
+        run: |
+          set -o pipefail
+          odoo \
+            -d test_db \
+            --db_host=postgres --db_port=5432 \
+            --db_user=odoo --db_password=odoo \
+            --addons-path="${{ steps.addons.outputs.path }}" \
+            -i "${{ steps.changed.outputs.modules }}" \
+            --test-enable \
+            --test-tags="${{ steps.changed.outputs.tags }}" \
+            --stop-after-init \
+            --log-level=test \
+            --no-http 2>&1 | tee odoo.log
+          STATUS=${PIPESTATUS[0]}
+
+          if grep -qE "inconsistent states|some depends are not loaded" odoo.log; then
+            echo "::error::A module was skipped due to missing dependencies - forcing failure"
+            STATUS=1
+          fi
+          if grep -q "CRITICAL" odoo.log; then
+            echo "::error::A CRITICAL log line was detected - forcing failure"
+            STATUS=1
+          fi
+          exit $STATUS
+
+      - name: No module changed
+        if: steps.changed.outputs.modules == ''
+        run: echo "No matching Odoo module changed in this PR - skipping tests."
